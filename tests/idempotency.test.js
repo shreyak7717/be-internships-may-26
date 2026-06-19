@@ -14,6 +14,30 @@ function spawnServer(port, extra = {}) {
   });
 }
 
+/**
+ * Poll GET /healthz until the server responds or timeout expires.
+ * Much more reliable than a blind fixed sleep.
+ */
+async function waitForServer(port, timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      await new Promise((resolve, reject) => {
+        const req = http.get(`http://localhost:${port}/healthz`, (res) => {
+          res.resume();
+          res.on('end', resolve);
+        });
+        req.on('error', reject);
+        req.setTimeout(200, () => { req.destroy(); reject(new Error('timeout')); });
+      });
+      return; // server is up
+    } catch {
+      await wait(50); // retry after 50 ms
+    }
+  }
+  throw new Error(`Server on port ${port} did not start within ${timeoutMs}ms`);
+}
+
 async function postJson(url, { headers = {}, body = {} } = {}) {
   return new Promise((resolve, reject) => {
     const data = JSON.stringify(body);
@@ -37,7 +61,7 @@ async function postJson(url, { headers = {}, body = {} } = {}) {
 // ---------------------------------------------------------------------------
 test('idempotency: sequential — same key always returns same id and 200', async () => {
   const proc = spawnServer(9100);
-  await wait(400);
+  await waitForServer(9100);
 
   const hdrs = { 'x-api-key': 'testkey', 'idempotency-key': 'seq-idem-1' };
   const bdyy = { userId: 'u1', type: 'note', payload: 'hello' };
@@ -45,10 +69,8 @@ test('idempotency: sequential — same key always returns same id and 200', asyn
   const a = await postJson('http://localhost:9100/v1/signals', { headers: hdrs, body: bdyy });
   const b = await postJson('http://localhost:9100/v1/signals', { headers: hdrs, body: bdyy });
 
-  // Both must succeed
-  assert.equal(a.status, 200, `first: expected 200, got ${a.status}`);
-  assert.equal(b.status, 200, `second: expected 200, got ${b.status}`);
-  // Must be the same resource
+  assert.equal(a.status, 200, `first: expected 200, got ${a.status} — ${JSON.stringify(a.body)}`);
+  assert.equal(b.status, 200, `second: expected 200, got ${b.status} — ${JSON.stringify(b.body)}`);
   assert.equal(a.body.id, b.body.id, 'ids must match');
   assert.equal(a.body.idempotencyKey, 'seq-idem-1');
 
@@ -60,7 +82,7 @@ test('idempotency: sequential — same key always returns same id and 200', asyn
 // ---------------------------------------------------------------------------
 test('idempotency: concurrent — 10 parallel requests share the same id, no 503', async () => {
   const proc = spawnServer(9101, { RATE_LIMIT_PER_MIN: '100' });
-  await wait(400);
+  await waitForServer(9101);
 
   const hdrs = { 'x-api-key': 'testkey', 'idempotency-key': 'concurrent-idem-1' };
   const bdyy = { userId: 'u2', type: 'event', payload: 'concurrent' };
@@ -85,21 +107,18 @@ test('idempotency: concurrent — 10 parallel requests share the same id, no 503
 });
 
 // ---------------------------------------------------------------------------
-// Test 3: Idempotent retry is NOT blocked by rate limit
+// Test 3: Idempotent retry bypasses rate limit
 // ---------------------------------------------------------------------------
 test('idempotency: retry with same key bypasses rate limit (not blocked by 429)', async () => {
-  // Rate limit = 1. After the first request the quota is exhausted.
-  // A retry with the same Idempotency-Key must still return 200.
   const proc = spawnServer(9102, { RATE_LIMIT_PER_MIN: '1' });
-  await wait(400);
+  await waitForServer(9102);
 
   const hdrs = { 'x-api-key': 'testkey', 'idempotency-key': 'rate-bypass-idem' };
   const bdyy = { userId: 'u3', type: 'ping', payload: 'original' };
 
   const first = await postJson('http://localhost:9102/v1/signals', { headers: hdrs, body: bdyy });
-  assert.equal(first.status, 200, `First request failed with ${first.status}`);
+  assert.equal(first.status, 200, `First request failed with ${first.status} — ${JSON.stringify(first.body)}`);
 
-  // This would be 429 for a NEW request, but must be 200 for an idem retry
   const retry = await postJson('http://localhost:9102/v1/signals', { headers: hdrs, body: bdyy });
   assert.equal(retry.status, 200, `Retry got ${retry.status} — should bypass rate limit`);
   assert.equal(retry.body.id, first.body.id, 'Retry must return the same resource');
@@ -108,11 +127,11 @@ test('idempotency: retry with same key bypasses rate limit (not blocked by 429)'
 });
 
 // ---------------------------------------------------------------------------
-// Test 4: DB failure resilience — retries recover under moderate fail rate
+// Test 4: DB failure resilience
 // ---------------------------------------------------------------------------
 test('db retry: moderate DB_FAIL_RATE=0.5 — at least 3/5 requests succeed', async () => {
   const proc = spawnServer(9103, { DB_FAIL_RATE: '0.5', RATE_LIMIT_PER_MIN: '100' });
-  await wait(400);
+  await waitForServer(9103);
 
   const results = await Promise.all(
     Array.from({ length: 5 }, (_, i) =>
@@ -124,8 +143,6 @@ test('db retry: moderate DB_FAIL_RATE=0.5 — at least 3/5 requests succeed', as
   );
 
   const successes = results.filter((r) => r.status === 200 || r.status === 201).length;
-  // With 5 retries and 0.5 fail rate, P(all 5 fail) = 0.5^5 ≈ 3%.
-  // We tolerate 2 failures to avoid flakiness on very slow CI.
   assert.ok(successes >= 3, `Expected ≥3 successes, got ${successes}`);
 
   proc.kill();
@@ -136,7 +153,7 @@ test('db retry: moderate DB_FAIL_RATE=0.5 — at least 3/5 requests succeed', as
 // ---------------------------------------------------------------------------
 test('no idempotency key: distinct records created for each request', async () => {
   const proc = spawnServer(9104, { RATE_LIMIT_PER_MIN: '100' });
-  await wait(400);
+  await waitForServer(9104);
 
   const a = await postJson('http://localhost:9104/v1/signals', {
     headers: { 'x-api-key': 'testkey' },
@@ -147,8 +164,8 @@ test('no idempotency key: distinct records created for each request', async () =
     body: { userId: 'u5', type: 'note', payload: 'second' },
   });
 
-  assert.equal(a.status, 201, `Expected 201, got ${a.status}`);
-  assert.equal(b.status, 201, `Expected 201, got ${b.status}`);
+  assert.equal(a.status, 201, `Expected 201, got ${a.status} — ${JSON.stringify(a.body)}`);
+  assert.equal(b.status, 201, `Expected 201, got ${b.status} — ${JSON.stringify(b.body)}`);
   assert.notEqual(a.body.id, b.body.id, 'Keyless requests must produce distinct ids');
 
   proc.kill();
@@ -159,9 +176,8 @@ test('no idempotency key: distinct records created for each request', async () =
 // ---------------------------------------------------------------------------
 test('GET /v1/signals returns items for userId', async () => {
   const proc = spawnServer(9105, { RATE_LIMIT_PER_MIN: '100' });
-  await wait(400);
+  await waitForServer(9105);
 
-  // Insert a signal first
   await postJson('http://localhost:9105/v1/signals', {
     headers: { 'x-api-key': 'testkey' },
     body: { userId: 'getuser', type: 'click', payload: 'btn' },
