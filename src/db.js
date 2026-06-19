@@ -7,11 +7,8 @@ fs.mkdirSync(path.dirname(dbPath), { recursive: true });
 
 const db = new Database(dbPath);
 
-// WAL mode: readers don't block writers, better concurrency for SQLite
 db.pragma('journal_mode = WAL');
-// Enforce foreign keys and tighten sync for crash safety without full fsync cost
 db.pragma('synchronous = NORMAL');
-// Increase busy timeout so concurrent writes queue rather than immediately fail
 db.pragma('busy_timeout = 5000');
 
 db.exec(`
@@ -35,9 +32,6 @@ db.exec(`
   );
 `);
 
-// ---------------------------------------------------------------------------
-// Failure simulation (set DB_FAIL_RATE=0.3 for 30% failure rate)
-// ---------------------------------------------------------------------------
 function maybeFail() {
   const rate = Number(process.env.DB_FAIL_RATE || 0);
   if (rate > 0 && Math.random() < rate) {
@@ -47,23 +41,18 @@ function maybeFail() {
   }
 }
 
-// ---------------------------------------------------------------------------
-// Retry / back-off with full jitter
-// Retryable SQLite codes: SQLITE_BUSY, SQLITE_LOCKED
-// ---------------------------------------------------------------------------
 const RETRYABLE = new Set(['SQLITE_BUSY', 'SQLITE_LOCKED', 'simulated_db_failure']);
 
 export async function withRetry(fn, { maxAttempts = 4, baseMs = 50, maxMs = 1000 } = {}) {
   let attempt = 0;
   while (true) {
     try {
-      return fn();            // better-sqlite3 is synchronous
+      return fn();            
     } catch (err) {
       attempt++;
       const retryable = RETRYABLE.has(err.code) || err.message === 'simulated_db_failure';
       if (!retryable || attempt >= maxAttempts) throw err;
 
-      // Full-jitter exponential back-off: sleep in [0, min(cap, base * 2^attempt)]
       const ceiling = Math.min(maxMs, baseMs * 2 ** attempt);
       const jitter   = Math.floor(Math.random() * ceiling);
       await new Promise(r => setTimeout(r, jitter));
@@ -71,16 +60,6 @@ export async function withRetry(fn, { maxAttempts = 4, baseMs = 50, maxMs = 1000
   }
 }
 
-// ---------------------------------------------------------------------------
-// Atomic upsert for idempotency
-//
-// Strategy: INSERT OR IGNORE on the UNIQUE(idempotency_key) constraint.
-// If a row already exists the INSERT is a no-op (no error, changes = 0).
-// We then SELECT to return the canonical row in both the new and duplicate case.
-// This is a single round-trip and race-free: two concurrent requests with the
-// same key will both hit the INSERT; exactly one wins, the other silently loses,
-// and both then read back the same persisted row.
-// ---------------------------------------------------------------------------
 const stmtInsertOrIgnore = db.prepare(
   `INSERT OR IGNORE INTO signals
      (user_id, type, payload, idempotency_key, created_at)
@@ -116,20 +95,12 @@ const stmtList = db.prepare(
    LIMIT ?`
 );
 
-// Wrapped in a serializable transaction so INSERT + SELECT are atomic
 const upsertAndFetch = db.transaction((userId, type, payload, idemKey, nowMs) => {
   stmtInsertOrIgnore.run(userId, type, String(payload), idemKey, nowMs);
   return stmtSelectByIdem.get(idemKey);
 });
 
-/**
- * insertSignal
- *
- * When idemKey is provided: uses atomic INSERT OR IGNORE + SELECT so concurrent
- * callers with the same key all receive the same persisted row without duplicates.
- *
- * When idemKey is null: plain INSERT, returns { lastInsertRowid }.
- */
+
 export async function insertSignal(userId, type, payload, idemKey, nowMs) {
   return withRetry(() => {
     maybeFail();
@@ -155,18 +126,6 @@ export async function listSignals(userId, limit) {
   });
 }
 
-// ---------------------------------------------------------------------------
-// Atomic rate-limit increment using SQLite as the counter store.
-//
-// Single UPSERT per request:
-//   • If no row yet → insert (window_start=now, cnt=1)
-//   • If within the same window  → increment cnt
-//   • If window expired          → reset to (window_start=now, cnt=1)
-//
-// Because SQLite serialises writes, this is race-free within one process.
-// For multi-process / multi-instance safety swap to a Redis INCR + EXPIRE
-// (see SCALE.md).
-// ---------------------------------------------------------------------------
 const WINDOW_MS = 60_000;
 
 const stmtRateUpsert = db.prepare(`
@@ -183,8 +142,6 @@ const stmtRateUpsert = db.prepare(`
 `);
 
 export function checkAndConsumeDB(userId, nowMs, rateLimit) {
-  // Synchronous — intentionally not wrapped in withRetry; if the rate table
-  // is unavailable we fail open (allow the request) rather than DoS the user.
   try {
     maybeFail();
     const row = stmtRateUpsert.get(userId, nowMs, nowMs, nowMs, nowMs);
@@ -193,7 +150,6 @@ export function checkAndConsumeDB(userId, nowMs, rateLimit) {
     const remaining = Math.max(rateLimit - row.cnt, 0);
     return { ok, remaining, resetMs };
   } catch (_) {
-    // Fail open on rate-limit DB errors — don't block legitimate traffic
     return { ok: true, remaining: rateLimit, resetMs: nowMs + WINDOW_MS };
   }
 }

@@ -8,9 +8,6 @@ const PORT = Number(process.env.PORT || 8080);
 
 const app = Fastify({ logger: { level: 'info' } });
 
-// ---------------------------------------------------------------------------
-// Auth hook — skip for healthz only (matched by exact path without query str)
-// ---------------------------------------------------------------------------
 app.addHook('onRequest', async (req, reply) => {
   if (req.routerPath === '/healthz') return;
   const key = req.headers['x-api-key'];
@@ -19,16 +16,10 @@ app.addHook('onRequest', async (req, reply) => {
   }
 });
 
-// ---------------------------------------------------------------------------
-// Routes
-// ---------------------------------------------------------------------------
 app.get('/healthz', async () => ({ ok: true }));
 app.post('/v1/signals', postSignal);
 app.get('/v1/signals', getSignals);
 
-// ---------------------------------------------------------------------------
-// Start
-// ---------------------------------------------------------------------------
 const start = async () => {
   try {
     await app.listen({ host: '0.0.0.0', port: PORT });
@@ -38,9 +29,6 @@ const start = async () => {
   }
 };
 
-// ---------------------------------------------------------------------------
-// Graceful shutdown — finish in-flight requests, then close cleanly
-// ---------------------------------------------------------------------------
 const shutdown = async (signal) => {
   app.log.info({ signal }, 'Shutting down gracefully...');
   try {

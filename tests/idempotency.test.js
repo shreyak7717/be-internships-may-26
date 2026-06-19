@@ -4,9 +4,6 @@ import { spawn } from 'node:child_process';
 import { setTimeout as wait } from 'node:timers/promises';
 import http from 'node:http';
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
 function spawnServer(port, extra = {}) {
   return spawn('node', ['src/server.js'], {
     env: { ...process.env, API_KEY: 'testkey', PORT: String(port), ...extra },
@@ -14,10 +11,6 @@ function spawnServer(port, extra = {}) {
   });
 }
 
-/**
- * Poll GET /healthz until the server responds or timeout expires.
- * Much more reliable than a blind fixed sleep.
- */
 async function waitForServer(port, timeoutMs = 5000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -56,9 +49,6 @@ async function postJson(url, { headers = {}, body = {} } = {}) {
   });
 }
 
-// ---------------------------------------------------------------------------
-// Test 1: Sequential idempotency — same key returns same resource
-// ---------------------------------------------------------------------------
 test('idempotency: sequential — same key always returns same id and 200', async () => {
   const proc = spawnServer(9100);
   await waitForServer(9100);
@@ -77,9 +67,6 @@ test('idempotency: sequential — same key always returns same id and 200', asyn
   proc.kill();
 });
 
-// ---------------------------------------------------------------------------
-// Test 2: Concurrent idempotency — 10 parallel requests, no 503, one unique id
-// ---------------------------------------------------------------------------
 test('idempotency: concurrent — 10 parallel requests share the same id, no 503', async () => {
   const proc = spawnServer(9101, { RATE_LIMIT_PER_MIN: '100' });
   await waitForServer(9101);
@@ -106,9 +93,6 @@ test('idempotency: concurrent — 10 parallel requests share the same id, no 503
   proc.kill();
 });
 
-// ---------------------------------------------------------------------------
-// Test 3: Idempotent retry bypasses rate limit
-// ---------------------------------------------------------------------------
 test('idempotency: retry with same key bypasses rate limit (not blocked by 429)', async () => {
   const proc = spawnServer(9102, { RATE_LIMIT_PER_MIN: '1' });
   await waitForServer(9102);
@@ -126,9 +110,6 @@ test('idempotency: retry with same key bypasses rate limit (not blocked by 429)'
   proc.kill();
 });
 
-// ---------------------------------------------------------------------------
-// Test 4: DB failure resilience
-// ---------------------------------------------------------------------------
 test('db retry: moderate DB_FAIL_RATE=0.5 — at least 3/5 requests succeed', async () => {
   const proc = spawnServer(9103, { DB_FAIL_RATE: '0.5', RATE_LIMIT_PER_MIN: '100' });
   await waitForServer(9103);
@@ -148,9 +129,6 @@ test('db retry: moderate DB_FAIL_RATE=0.5 — at least 3/5 requests succeed', as
   proc.kill();
 });
 
-// ---------------------------------------------------------------------------
-// Test 5: No Idempotency-Key — each request creates a distinct record
-// ---------------------------------------------------------------------------
 test('no idempotency key: distinct records created for each request', async () => {
   const proc = spawnServer(9104, { RATE_LIMIT_PER_MIN: '100' });
   await waitForServer(9104);
@@ -171,9 +149,6 @@ test('no idempotency key: distinct records created for each request', async () =
   proc.kill();
 });
 
-// ---------------------------------------------------------------------------
-// Test 6: GET /v1/signals lists records for a user
-// ---------------------------------------------------------------------------
 test('GET /v1/signals returns items for userId', async () => {
   const proc = spawnServer(9105, { RATE_LIMIT_PER_MIN: '100' });
   await waitForServer(9105);

@@ -1,32 +1,7 @@
-/**
- * rateLimit.js — Per-userId sliding-window rate limiter
- *
- * Algorithm: sliding-window log
- *   Each user entry is an array of request timestamps within the last WINDOW_MS.
- *   On each call, timestamps older than (now - WINDOW_MS) are pruned first.
- *   If the remaining count is below the limit, the request is allowed and the
- *   timestamp is appended.
- *
- * Concurrency safety (single Node.js process):
- *   JavaScript's event loop is single-threaded; the Map read-modify-write is
- *   never interrupted by another incoming request callback, so there is NO
- *   race condition within one process.
- *
- * Multi-instance note:
- *   Each process has its own in-memory Map — rate limits are per-process.
- *   For true cross-instance enforcement, swap to Redis (see SCALE.md):
- *     ZADD / ZREMRANGEBYSCORE / ZCARD in a Lua script for atomic sliding window.
- *
- * Optional DB-backed path:
- *   Set USE_DB_RATE_LIMIT=true to route through the SQLite atomic UPSERT
- *   in db.js — race-free across all processes on the same host.
- */
-
 import { checkAndConsumeDB } from './db.js';
 
 const WINDOW_MS = 60_000;
 
-// In-memory store: userId → sorted array of request timestamps (ms)
 const buckets = new Map();
 
 /**
@@ -40,7 +15,6 @@ export function checkAndConsume(userId, nowMs = Date.now()) {
   const rate    = Number(process.env.RATE_LIMIT_PER_MIN || 5);
   const wStart  = nowMs - WINDOW_MS;
 
-  // Prune expired timestamps and retrieve active ones
   let timestamps = (buckets.get(userId) || []).filter(ts => ts > wStart);
 
   if (timestamps.length >= rate) {

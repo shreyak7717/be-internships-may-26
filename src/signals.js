@@ -3,23 +3,14 @@ import { checkAndConsume } from './rateLimit.js';
 
 function nowMs() { return Date.now(); }
 
-// ---------------------------------------------------------------------------
-// POST /v1/signals
-// ---------------------------------------------------------------------------
 export async function postSignal(req, reply) {
   const idem = req.headers['idempotency-key'] || null;
   const { userId, type, payload } = req.body || {};
 
-  // --- Validation -----------------------------------------------------------
   if (!userId || !type || typeof payload === 'undefined') {
     return reply.code(400).send({ error: 'invalid_body' });
   }
 
-  // --- Idempotency short-circuit BEFORE rate limiting -----------------------
-  // Check DB first. If the key already exists, return the stored resource
-  // immediately WITHOUT consuming rate-limit quota.
-  // This guarantees: idempotent retries are never blocked by a 429,
-  // even if the client's window is exhausted.
   if (idem) {
     try {
       const existing = await getByIdemKey(idem);
@@ -32,27 +23,19 @@ export async function postSignal(req, reply) {
     }
   }
 
-  // --- Rate limit (only for genuinely new requests) -------------------------
   const { ok, remaining, resetMs } = checkAndConsume(userId, nowMs());
   if (!ok) {
     return reply.code(429).send({ error: 'rate_limited', remaining, resetMs });
   }
 
-  // --- Insert ---------------------------------------------------------------
-  // db.insertSignal uses an atomic INSERT OR IGNORE + SELECT transaction
-  // when an idemKey is provided, so concurrent duplicate requests with the
-  // same key are race-free: one wins the INSERT, both SELECT the same row.
   const t = nowMs();
   try {
     const result = await insertSignal(userId, type, payload, idem, t);
 
     if (idem) {
-      // For keyed inserts, result is always the full canonical row (new or existing).
-      // Always respond 200 so every request with the same key gets the same status.
       return reply.code(200).send(result);
     }
 
-    // No idempotency key — plain insert; result = { lastInsertRowid, created }
     return reply.code(201).send({
       id:             Number(result.lastInsertRowid),
       userId,
@@ -67,9 +50,6 @@ export async function postSignal(req, reply) {
   }
 }
 
-// ---------------------------------------------------------------------------
-// GET /v1/signals?userId=…&limit=…
-// ---------------------------------------------------------------------------
 export async function getSignals(req, reply) {
   const { userId, limit = 20 } = req.query || {};
   if (!userId) return reply.code(400).send({ error: 'missing_userId' });
